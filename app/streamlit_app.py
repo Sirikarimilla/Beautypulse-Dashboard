@@ -1,9 +1,7 @@
-import os
 import re
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
-from dotenv import load_dotenv
 
 # -----------------------
 # Page setup
@@ -13,15 +11,15 @@ st.title("💄 BeautyPulse – Skincare & Makeup Insights")
 st.caption("Open Beauty Facts + Data Engineering pipeline + Ingredients analytics")
 
 # -----------------------
-# Load env + DB engine
+# DB engine (Streamlit Cloud-safe)
 # -----------------------
-load_dotenv()
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    st.error("DATABASE_URL not found. Check your .env file.")
-    st.stop()
+@st.cache_resource
+def get_engine():
+    # Streamlit Cloud uses st.secrets; locally you can also set it in .streamlit/secrets.toml
+    db_url = st.secrets["DATABASE_URL"]
+    return create_engine(db_url, pool_pre_ping=True)
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+engine = get_engine()
 
 @st.cache_data(ttl=300)
 def run_query(sql: str) -> pd.DataFrame:
@@ -35,8 +33,8 @@ def tokenize_ingredients(txt: str) -> list[str]:
     if not txt:
         return []
     t = txt.lower()
-    t = re.sub(r"\([^)]*\)", " ", t)
-    t = re.sub(r"[%\d]", " ", t)
+    t = re.sub(r"\([^)]*\)", " ", t)  # remove bracket notes
+    t = re.sub(r"[%\d]", " ", t)      # remove digits/percents
     parts = re.split(r"[;,/]", t)
     out = []
     for p in parts:
@@ -64,9 +62,7 @@ def flag_parabens(txt: str) -> bool:
     return any(p in t for p in ["methylparaben", "propylparaben", "butylparaben", "ethylparaben"])
 
 def link_cta(label: str, url: str):
-    """
-    Streamlit link button exists in newer versions; fallback to markdown link.
-    """
+    """Streamlit link button exists in newer versions; fallback to markdown link."""
     if not url:
         return
     if hasattr(st, "link_button"):
@@ -83,7 +79,7 @@ page = st.sidebar.radio(
 )
 
 # ======================================================
-# HOME
+# HOME (KPIs)
 # ======================================================
 if page == "Home (KPIs)":
     kpis = run_query("""
@@ -108,16 +104,18 @@ if page == "Home (KPIs)":
     c6.metric("With Links", int(kpis.with_links))
     c7.metric("With Ingredients", int(kpis.with_ingredients))
 
-    st.write(f"**Last Updated:** {kpis.last_updated.strftime('%Y-%m-%d %H:%M:%S')}")
+    if kpis.last_updated is not None:
+        st.write(f"**Last Updated:** {pd.to_datetime(kpis.last_updated).strftime('%Y-%m-%d %H:%M:%S')}")
+
     st.divider()
 
+    st.subheader("Category Split")
     split_df = run_query("""
     SELECT category, COUNT(*) AS count
     FROM products
     GROUP BY category
     ORDER BY count DESC;
     """)
-    st.subheader("Category Split")
     st.bar_chart(split_df.set_index("category"))
 
 # ======================================================
@@ -139,7 +137,6 @@ elif page == "Product Explorer (Cards)":
     ORDER BY updated_at DESC;
     """)
 
-    # Filters
     f1, f2, f3 = st.columns(3)
     categories = ["All"] + sorted(df["category"].dropna().unique().tolist())
     brands = ["All"] + sorted(df["brand"].dropna().unique().tolist())
@@ -161,8 +158,7 @@ elif page == "Product Explorer (Cards)":
 
     if view_mode == "Table":
         display_df = df.copy()
-        display_df["updated_at"] = pd.to_datetime(display_df["updated_at"]).dt.strftime("%Y-%m-%d %H:%M:%S")
-
+        display_df["updated_at"] = pd.to_datetime(display_df["updated_at"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
         display_df.reset_index(drop=True, inplace=True)
         display_df.index = display_df.index + 1
         display_df.index.name = "S.No"
@@ -171,9 +167,7 @@ elif page == "Product Explorer (Cards)":
             display_df[["name", "brand", "category", "subcategory", "updated_at"]],
             use_container_width=True
         )
-
     else:
-        # Cards
         max_cards = st.slider("How many cards to show", 6, 60, 18, step=6)
         cards_df = df.copy().reset_index(drop=True).head(max_cards)
 
@@ -216,7 +210,7 @@ elif page == "Ingredients Analytics":
     """)
 
     if base.empty:
-        st.warning("No ingredients_text found. Run pipeline after adding ingredients_text column + loading it.")
+        st.warning("No ingredients_text found. Run your pipeline to load ingredients.")
         st.stop()
 
     base["has_alcohol"] = base["ingredients_text"].apply(flag_alcohol)
@@ -263,11 +257,25 @@ elif page == "Ingredients Analytics":
     for txt in temp["ingredients_text"].tolist():
         tokens.extend(tokenize_ingredients(txt))
 
+    if not tokens:
+        st.info("No tokens extracted from ingredients text.")
+        st.stop()
+
     top = pd.Series(tokens).value_counts().head(30).reset_index()
     top.columns = ["ingredient", "count"]
     top.index = top.index + 1
     top.index.name = "S.No"
     st.dataframe(top, use_container_width=True)
+
+    st.divider()
+
+    st.subheader("Flagged examples (first 25)")
+    flagged = base[(base["has_alcohol"]) | (base["has_fragrance"]) | (base["has_parabens"])].copy()
+    flagged = flagged[["name", "brand", "category", "has_alcohol", "has_fragrance", "has_parabens"]].head(25)
+    flagged.reset_index(drop=True, inplace=True)
+    flagged.index = flagged.index + 1
+    flagged.index.name = "S.No"
+    st.dataframe(flagged, use_container_width=True)
 
 # ======================================================
 # BRAND INSIGHTS
@@ -294,6 +302,7 @@ elif page == "Brand Insights":
     st.dataframe(brand_df, use_container_width=True)
 
     st.divider()
+
     st.subheader("Top Brands Chart")
     chart_df = (
         brand_df.groupby("brand", as_index=False)["product_count"]
@@ -325,11 +334,12 @@ elif page == "Pipeline Status":
 
     if runs_df.empty:
         st.info("No pipeline runs found yet.")
-    else:
-        for col in ["started_at", "finished_at"]:
-            runs_df[col] = pd.to_datetime(runs_df[col], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+        st.stop()
 
-        runs_df.reset_index(drop=True, inplace=True)
-        runs_df.index = runs_df.index + 1
-        runs_df.index.name = "Run #"
-        st.dataframe(runs_df, use_container_width=True)
+    for col in ["started_at", "finished_at"]:
+        runs_df[col] = pd.to_datetime(runs_df[col], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    runs_df.reset_index(drop=True, inplace=True)
+    runs_df.index = runs_df.index + 1
+    runs_df.index.name = "Run #"
+    st.dataframe(runs_df, use_container_width=True)
