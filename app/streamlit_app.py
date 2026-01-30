@@ -11,20 +11,32 @@ st.title("💄 BeautyPulse – Skincare & Makeup Insights")
 st.caption("Open Beauty Facts + Data Engineering pipeline + Ingredients analytics")
 
 # -----------------------
-# DB engine (Streamlit Cloud-safe)
+# Helpers
 # -----------------------
 @st.cache_resource
 def get_engine():
-    # Streamlit Cloud uses st.secrets; locally you can also set it in .streamlit/secrets.toml
+    # Streamlit Cloud: set DATABASE_URL in Secrets (TOML)
     db_url = st.secrets["DATABASE_URL"]
     return create_engine(db_url, pool_pre_ping=True)
 
 engine = get_engine()
 
 @st.cache_data(ttl=300)
-def run_query(sql: str) -> pd.DataFrame:
+def run_query(sql: str, params: dict | None = None) -> pd.DataFrame:
     with engine.begin() as conn:
-        return pd.read_sql(text(sql), conn)
+        return pd.read_sql(text(sql), conn, params=params or {})
+
+def download_button_df(label: str, df: pd.DataFrame, filename: str):
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button(label, csv, file_name=filename, mime="text/csv")
+
+def link_cta(label: str, url: str):
+    if not url:
+        return
+    if hasattr(st, "link_button"):
+        st.link_button(label, url)
+    else:
+        st.markdown(f"[{label}]({url})")
 
 # -----------------------
 # Ingredient helpers
@@ -33,8 +45,8 @@ def tokenize_ingredients(txt: str) -> list[str]:
     if not txt:
         return []
     t = txt.lower()
-    t = re.sub(r"\([^)]*\)", " ", t)  # remove bracket notes
-    t = re.sub(r"[%\d]", " ", t)      # remove digits/percents
+    t = re.sub(r"\([^)]*\)", " ", t)
+    t = re.sub(r"[%\d]", " ", t)
     parts = re.split(r"[;,/]", t)
     out = []
     for p in parts:
@@ -61,39 +73,57 @@ def flag_parabens(txt: str) -> bool:
     t = txt.lower()
     return any(p in t for p in ["methylparaben", "propylparaben", "butylparaben", "ethylparaben"])
 
-def link_cta(label: str, url: str):
-    """Streamlit link button exists in newer versions; fallback to markdown link."""
-    if not url:
-        return
-    if hasattr(st, "link_button"):
-        st.link_button(label, url)
-    else:
-        st.markdown(f"[{label}]({url})")
+def ingredient_risk_score(txt: str) -> tuple[int, list[str]]:
+    """
+    Simple explainable scoring:
+    +3 parabens, +2 alcohol, +1 fragrance
+    """
+    reasons = []
+    score = 0
+    if flag_parabens(txt):
+        score += 3
+        reasons.append("Parabens detected")
+    if flag_alcohol(txt):
+        score += 2
+        reasons.append("Drying alcohol detected")
+    if flag_fragrance(txt):
+        score += 1
+        reasons.append("Fragrance detected")
+    return score, reasons
 
 # -----------------------
 # Sidebar navigation
 # -----------------------
 page = st.sidebar.radio(
     "Navigate",
-    ["Home (KPIs)", "Product Explorer (Cards)", "Ingredients Analytics", "Brand Insights", "Pipeline Status"]
+    [
+        "Home (KPIs)",
+        "Product Explorer (Cards)",
+        "Ingredients Analytics",
+        "Ingredient Checker",
+        "Brand Insights",
+        "Pipeline Status",
+    ],
 )
 
 # ======================================================
-# HOME (KPIs)
+# HOME
 # ======================================================
 if page == "Home (KPIs)":
-    kpis = run_query("""
-    SELECT
-      COUNT(*) AS total_products,
-      COUNT(DISTINCT brand) AS total_brands,
-      SUM(CASE WHEN category = 'skincare' THEN 1 ELSE 0 END) AS skincare_products,
-      SUM(CASE WHEN category = 'makeup' THEN 1 ELSE 0 END) AS makeup_products,
-      SUM(CASE WHEN image_url IS NOT NULL AND image_url <> '' THEN 1 ELSE 0 END) AS with_images,
-      SUM(CASE WHEN product_url IS NOT NULL AND product_url <> '' THEN 1 ELSE 0 END) AS with_links,
-      SUM(CASE WHEN ingredients_text IS NOT NULL AND ingredients_text <> '' THEN 1 ELSE 0 END) AS with_ingredients,
-      MAX(updated_at) AS last_updated
-    FROM products;
-    """).iloc[0]
+    kpis = run_query(
+        """
+        SELECT
+          COUNT(*) AS total_products,
+          COUNT(DISTINCT brand) AS total_brands,
+          SUM(CASE WHEN category = 'skincare' THEN 1 ELSE 0 END) AS skincare_products,
+          SUM(CASE WHEN category = 'makeup' THEN 1 ELSE 0 END) AS makeup_products,
+          SUM(CASE WHEN image_url IS NOT NULL AND image_url <> '' THEN 1 ELSE 0 END) AS with_images,
+          SUM(CASE WHEN product_url IS NOT NULL AND product_url <> '' THEN 1 ELSE 0 END) AS with_links,
+          SUM(CASE WHEN ingredients_text IS NOT NULL AND ingredients_text <> '' THEN 1 ELSE 0 END) AS with_ingredients,
+          MAX(updated_at) AS last_updated
+        FROM products;
+        """
+    ).iloc[0]
 
     c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
     c1.metric("Total Products", int(kpis.total_products))
@@ -110,32 +140,37 @@ if page == "Home (KPIs)":
     st.divider()
 
     st.subheader("Category Split")
-    split_df = run_query("""
-    SELECT category, COUNT(*) AS count
-    FROM products
-    GROUP BY category
-    ORDER BY count DESC;
-    """)
+    split_df = run_query(
+        """
+        SELECT category, COUNT(*) AS count
+        FROM products
+        GROUP BY category
+        ORDER BY count DESC;
+        """
+    )
     st.bar_chart(split_df.set_index("category"))
+    download_button_df("⬇️ Download category split CSV", split_df, "category_split.csv")
 
 # ======================================================
-# PRODUCT EXPLORER (TABLE + CARDS)
+# PRODUCT EXPLORER
 # ======================================================
 elif page == "Product Explorer (Cards)":
     st.subheader("🖼️ Product Explorer (Table + Cards)")
 
-    df = run_query("""
-    SELECT
-      name,
-      brand,
-      category,
-      subcategory,
-      image_url,
-      product_url,
-      updated_at
-    FROM products
-    ORDER BY updated_at DESC;
-    """)
+    df = run_query(
+        """
+        SELECT
+          name,
+          brand,
+          category,
+          subcategory,
+          image_url,
+          product_url,
+          updated_at
+        FROM products
+        ORDER BY updated_at DESC;
+        """
+    )
 
     f1, f2, f3 = st.columns(3)
     categories = ["All"] + sorted(df["category"].dropna().unique().tolist())
@@ -153,19 +188,22 @@ elif page == "Product Explorer (Cards)":
         df = df[df["name"].str.contains(search_text, case=False, na=False)]
 
     st.caption(f"Showing **{len(df)}** products")
+    download_button_df("⬇️ Download filtered products CSV", df.reset_index(drop=True), "filtered_products.csv")
 
     view_mode = st.radio("View mode", ["Cards", "Table"], horizontal=True)
 
     if view_mode == "Table":
         display_df = df.copy()
-        display_df["updated_at"] = pd.to_datetime(display_df["updated_at"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+        display_df["updated_at"] = pd.to_datetime(display_df["updated_at"], errors="coerce").dt.strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
         display_df.reset_index(drop=True, inplace=True)
         display_df.index = display_df.index + 1
         display_df.index.name = "S.No"
 
         st.dataframe(
             display_df[["name", "brand", "category", "subcategory", "updated_at"]],
-            use_container_width=True
+            use_container_width=True,
         )
     else:
         max_cards = st.slider("How many cards to show", 6, 60, 18, step=6)
@@ -197,20 +235,18 @@ elif page == "Product Explorer (Cards)":
 # INGREDIENTS ANALYTICS
 # ======================================================
 elif page == "Ingredients Analytics":
-    st.subheader("🧪 Ingredients Analytics (Top ingredients + Alcohol/Paraben detection)")
+    st.subheader("🧪 Ingredients Analytics (Top ingredients + Alcohol/Fragrance/Paraben detection)")
 
-    base = run_query("""
-    SELECT
-      name,
-      brand,
-      category,
-      ingredients_text
-    FROM products
-    WHERE ingredients_text IS NOT NULL AND ingredients_text <> '';
-    """)
+    base = run_query(
+        """
+        SELECT name, brand, category, ingredients_text
+        FROM products
+        WHERE ingredients_text IS NOT NULL AND ingredients_text <> '';
+        """
+    )
 
     if base.empty:
-        st.warning("No ingredients_text found. Run your pipeline to load ingredients.")
+        st.warning("No ingredients_text found. Run pipeline to load ingredients.")
         st.stop()
 
     base["has_alcohol"] = base["ingredients_text"].apply(flag_alcohol)
@@ -234,16 +270,20 @@ elif page == "Ingredients Analytics":
     flags_by_cat["has_alcohol"] = (flags_by_cat["has_alcohol"] * 100).round(2)
     flags_by_cat["has_fragrance"] = (flags_by_cat["has_fragrance"] * 100).round(2)
     flags_by_cat["has_parabens"] = (flags_by_cat["has_parabens"] * 100).round(2)
-    flags_by_cat.rename(columns={
-        "has_alcohol": "% Alcohol",
-        "has_fragrance": "% Fragrance",
-        "has_parabens": "% Parabens"
-    }, inplace=True)
+    flags_by_cat.rename(
+        columns={
+            "has_alcohol": "% Alcohol",
+            "has_fragrance": "% Fragrance",
+            "has_parabens": "% Parabens",
+        },
+        inplace=True,
+    )
 
     flags_by_cat.reset_index(drop=True, inplace=True)
     flags_by_cat.index = flags_by_cat.index + 1
     flags_by_cat.index.name = "S.No"
     st.dataframe(flags_by_cat, use_container_width=True)
+    download_button_df("⬇️ Download flags-by-category CSV", flags_by_cat.reset_index(drop=True), "flags_by_category.csv")
 
     st.divider()
 
@@ -258,7 +298,7 @@ elif page == "Ingredients Analytics":
         tokens.extend(tokenize_ingredients(txt))
 
     if not tokens:
-        st.info("No tokens extracted from ingredients text.")
+        st.info("No tokens extracted.")
         st.stop()
 
     top = pd.Series(tokens).value_counts().head(30).reset_index()
@@ -266,16 +306,71 @@ elif page == "Ingredients Analytics":
     top.index = top.index + 1
     top.index.name = "S.No"
     st.dataframe(top, use_container_width=True)
+    download_button_df("⬇️ Download top ingredients CSV", top.reset_index(drop=True), "top_ingredients.csv")
 
-    st.divider()
+# ======================================================
+# INGREDIENT CHECKER (SEARCH + RISK SCORE)
+# ======================================================
+elif page == "Ingredient Checker":
+    st.subheader("🔍 Ingredient Checker (Search + Risk Score)")
+    st.caption("Search an ingredient (e.g., niacinamide, retinol, fragrance, alcohol denat) and compare products.")
 
-    st.subheader("Flagged examples (first 25)")
-    flagged = base[(base["has_alcohol"]) | (base["has_fragrance"]) | (base["has_parabens"])].copy()
-    flagged = flagged[["name", "brand", "category", "has_alcohol", "has_fragrance", "has_parabens"]].head(25)
-    flagged.reset_index(drop=True, inplace=True)
-    flagged.index = flagged.index + 1
-    flagged.index.name = "S.No"
-    st.dataframe(flagged, use_container_width=True)
+    search = st.text_input("Ingredient keyword", placeholder="e.g., niacinamide")
+    cat = st.selectbox("Filter category", ["All", "skincare", "makeup"])
+    limit = st.slider("Max results", 10, 200, 50, step=10)
+
+    if not search.strip():
+        st.info("Enter an ingredient keyword to search.")
+        st.stop()
+
+    df = run_query(
+        """
+        SELECT name, brand, category, ingredients_text, image_url, product_url
+        FROM products
+        WHERE ingredients_text IS NOT NULL AND ingredients_text <> ''
+          AND LOWER(ingredients_text) LIKE '%' || LOWER(:kw) || '%'
+        ORDER BY updated_at DESC
+        LIMIT 1000;
+        """,
+        params={"kw": search.strip()},
+    )
+
+    if df.empty:
+        st.warning("No products found containing that keyword.")
+        st.stop()
+
+    if cat != "All":
+        df = df[df["category"] == cat]
+
+    scores = df["ingredients_text"].apply(ingredient_risk_score)
+    df["risk_score"] = [s[0] for s in scores]
+    df["reasons"] = [", ".join(s[1]) if s[1] else "No flags" for s in scores]
+
+    df = df.sort_values(["risk_score", "brand", "name"]).head(limit).reset_index(drop=True)
+
+    st.write(f"Found **{len(df)}** matching products.")
+    download_button_df(
+        "⬇️ Download ingredient search results CSV",
+        df.drop(columns=["ingredients_text"], errors="ignore"),
+        f"ingredient_search_{search.strip().lower()}.csv",
+    )
+
+    cols = st.columns(3)
+    for i, row in df.iterrows():
+        with cols[i % 3]:
+            img = (row.get("image_url") or "").strip()
+            if img:
+                st.image(img, use_container_width=True)
+
+            st.markdown(f"**{row['name']}**")
+            st.write(f"Brand: {row['brand']}")
+            st.write(f"Category: {row['category']}")
+            st.write(f"Risk score: **{row['risk_score']}**")
+            st.caption(row["reasons"])
+
+            url = (row.get("product_url") or "").strip()
+            if url:
+                link_cta("Open Product", url)
 
 # ======================================================
 # BRAND INSIGHTS
@@ -283,23 +378,26 @@ elif page == "Ingredients Analytics":
 elif page == "Brand Insights":
     st.subheader("🏷️ Brand Insights")
 
-    brand_df = run_query("""
-    SELECT
-      brand,
-      category,
-      COUNT(*) AS product_count,
-      SUM(CASE WHEN image_url IS NOT NULL AND image_url <> '' THEN 1 ELSE 0 END) AS with_images
-    FROM products
-    GROUP BY brand, category
-    HAVING COUNT(*) >= 3
-    ORDER BY product_count DESC
-    LIMIT 50;
-    """)
+    brand_df = run_query(
+        """
+        SELECT
+          brand,
+          category,
+          COUNT(*) AS product_count,
+          SUM(CASE WHEN image_url IS NOT NULL AND image_url <> '' THEN 1 ELSE 0 END) AS with_images
+        FROM products
+        GROUP BY brand, category
+        HAVING COUNT(*) >= 3
+        ORDER BY product_count DESC
+        LIMIT 50;
+        """
+    )
 
     brand_df.reset_index(drop=True, inplace=True)
     brand_df.index = brand_df.index + 1
     brand_df.index.name = "S.No"
     st.dataframe(brand_df, use_container_width=True)
+    download_button_df("⬇️ Download brand insights CSV", brand_df.reset_index(drop=True), "brand_insights.csv")
 
     st.divider()
 
@@ -318,19 +416,21 @@ elif page == "Brand Insights":
 elif page == "Pipeline Status":
     st.subheader("🛠 Pipeline Status")
 
-    runs_df = run_query("""
-    SELECT
-      run_id,
-      started_at,
-      finished_at,
-      status,
-      rows_upserted,
-      rows_snapshotted,
-      error_message
-    FROM pipeline_runs
-    ORDER BY started_at DESC
-    LIMIT 20;
-    """)
+    runs_df = run_query(
+        """
+        SELECT
+          run_id,
+          started_at,
+          finished_at,
+          status,
+          rows_upserted,
+          rows_snapshotted,
+          error_message
+        FROM pipeline_runs
+        ORDER BY started_at DESC
+        LIMIT 20;
+        """
+    )
 
     if runs_df.empty:
         st.info("No pipeline runs found yet.")
@@ -343,3 +443,4 @@ elif page == "Pipeline Status":
     runs_df.index = runs_df.index + 1
     runs_df.index.name = "Run #"
     st.dataframe(runs_df, use_container_width=True)
+    download_button_df("⬇️ Download pipeline runs CSV", runs_df.reset_index(drop=True), "pipeline_runs.csv")
